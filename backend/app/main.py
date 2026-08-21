@@ -1,8 +1,12 @@
 """DataPilot — Autonomous Data Analyst API."""
 from __future__ import annotations
 
+
+import gc
 import math
 import os
+import tempfile
+from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -129,42 +133,148 @@ async def upload(file: UploadFile = File(...)):
             detail="No file provided.",
         )
 
-    content = await file.read()
+    ext = Path(file.filename).suffix.lower()
 
-    if len(content) > MAX_FILE_SIZE:
+    if ext not in {".csv", ".xlsx", ".xls"}:
         raise HTTPException(
-            status_code=413,
+            status_code=422,
             detail=(
-                f"File exceeds the maximum size of "
-                f"{MAX_FILE_SIZE // (1024 * 1024)} MB."
+                "Unsupported file format. "
+                "Please upload a CSV, XLSX, or XLS file."
             ),
         )
 
+    dataset_id = None
+    temp_path = None
+
     try:
-        dataset_id = data_loader.save_upload(
-            file.filename,
-            content,
+        # ---------------------------------------------------------
+        # Stream upload to disk instead of loading the complete
+        # file into RAM.
+        # ---------------------------------------------------------
+
+        dataset_id = os.urandom(8).hex()
+
+        temp_path = (
+            Path(
+                tempfile.gettempdir()
+            )
+            / f"datapilot_{dataset_id}{ext}"
         )
-        profile = _ensure_profile(dataset_id)
+
+        total_size = 0
+        chunk_size = 1024 * 1024  # 1 MB
+
+        with temp_path.open("wb") as output:
+
+            while True:
+                chunk = await file.read(
+                    chunk_size
+                )
+
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_FILE_SIZE:
+                    output.close()
+
+                    try:
+                        temp_path.unlink(
+                            missing_ok=True
+                        )
+                    except OSError:
+                        pass
+
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "File exceeds the maximum "
+                            f"size of "
+                            f"{MAX_FILE_SIZE // (1024 * 1024)} MB."
+                        ),
+                    )
+
+                output.write(chunk)
+
+        # ---------------------------------------------------------
+        # Register the file with the dataset loader.
+        # ---------------------------------------------------------
+
+        meta = {
+            "path": temp_path,
+            "name": file.filename,
+            "size": total_size,
+            "df": None,
+            "profile": None,
+            "correlations": None,
+            "outliers": None,
+            "charts": None,
+            "analysis": None,
+        }
+
+        data_loader._DATASETS[dataset_id] = meta
+
+        # ---------------------------------------------------------
+        # Build profile.
+        # ---------------------------------------------------------
+
+        profile = _ensure_profile(
+            dataset_id
+        )
+
+        # Release upload-related temporary memory.
+        gc.collect()
+
+        return {
+            "dataset_id": dataset_id,
+            "message": (
+                "Dataset successfully processed "
+                "and ready for deterministic analysis."
+            ),
+            "profile": profile,
+        }
+
+    except HTTPException:
+        raise
 
     except ValueError as exc:
-        if "dataset_id" in locals():
-            data_loader.cleanup_dataset(dataset_id)
+
+        if dataset_id:
+            data_loader.cleanup_dataset(
+                dataset_id
+            )
+
         raise HTTPException(
             status_code=422,
             detail=str(exc),
         ) from exc
 
-    return {
-        "dataset_id": dataset_id,
-        "message": (
-            "Dataset successfully processed and ready "
-            "for deterministic analysis."
-        ),
-        "profile": profile,
-    }
+    except Exception as exc:
 
+        if dataset_id:
+            data_loader.cleanup_dataset(
+                dataset_id
+            )
+        elif temp_path:
+            try:
+                temp_path.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
 
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upload failed: {exc}",
+        ) from exc
+
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 @app.get("/dataset/{dataset_id}/profile")
 def get_profile(dataset_id: str):
     try:
