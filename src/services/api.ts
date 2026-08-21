@@ -1,4 +1,4 @@
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = 'https://autonomous-data-analyst-sr93.onrender.com';
 
 export interface Profile {
   dataset_name: string;
